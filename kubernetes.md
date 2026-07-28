@@ -1366,17 +1366,7 @@ How to read it: *"keep `catalogue` between 1 and 10 pods, adding replicas whenev
 
 ### Controlling *where* pods land
 
-Scaling decides **how many** pods; a separate family of settings decides **which node** each one goes to. Three mechanisms, worth knowing by name:
-
-| Mechanism | What it does |
-|-----------|--------------|
-| **Taints and tolerations** | The *node* repels pods; only pods with a matching **toleration** may land there |
-| **Node affinity / anti-affinity** | The *pod* states a preference or requirement about **which nodes** it wants |
-| **Pod affinity / anti-affinity** | The *pod* states a preference about **which other pods** to sit with or avoid |
-
-The distinction that sticks: **taints are the node pushing pods away; affinity is the pod pulling itself toward (or away from) something.** Pod anti-affinity is how you spread database replicas across different nodes so one node failure can't take out the whole cluster.
-
-*(`nodeSelector` — used earlier to pin a pod to the EBS volume's AZ — is the simplest member of this family.)*
+Scaling decides **how many** pods; a separate family of settings — `nodeSelector`, taints/tolerations, node affinity, pod affinity — decides **which node** each one goes to. That's a topic in its own right; see [Scheduling — Placing Pods on the Right Nodes](#scheduling--placing-pods-on-the-right-nodes) below.
 
 ### k9s
 
@@ -1385,6 +1375,224 @@ A terminal UI for the cluster — far faster than typing `kubectl get`/`describe
 ```bash
 curl -sS https://webinstall.dev/k9s | bash
 ```
+
+---
+
+## Scheduling — Placing Pods on the Right Nodes
+
+By default the **scheduler** picks a node for each pod on its own — it looks at which nodes have enough free `requests` and drops the pod on one that fits. Most of the time that's exactly what you want. **Selectors** are how you override it: *controlling the scheduler to run pods on the nodes you choose.* There are four mechanisms, from bluntest to most expressive.
+
+Every node already carries a set of labels you can select on. On EKS they're generated for you — a real node looks like this:
+
+```text
+eks.amazonaws.com/capacityType=SPOT
+node.kubernetes.io/instance-type=c3.large
+topology.kubernetes.io/zone=us-east-1c
+topology.kubernetes.io/region=us-east-1
+kubernetes.io/hostname=ip-192-168-1-236.ec2.internal
+kubernetes.io/arch=amd64
+kubernetes.io/os=linux
+```
+
+So without doing anything you can already target a zone, an instance type, or spot-vs-on-demand. You can also add your own — `kubectl label node ip-192-168-1-236.ec2.internal project=roboshop` — and select on that.
+
+### 1. nodeSelector — the blunt instrument
+
+A single key/value that a node must have. Put it in the pod spec:
+
+```yaml
+spec:
+  nodeSelector:
+    project: roboshop
+```
+
+**It's a hard rule.** If no node carries that exact label, the pod doesn't get placed somewhere close — it sits in **`Pending`** forever. Simple, but one label only and no "prefer" fallback. This is the same tool used earlier to pin a pod to its EBS volume's availability zone.
+
+### 2. Taints and tolerations — the node pushes back
+
+A **taint** is the node saying *"keep out."* (Think of *taint* as **painted / polluted** — the scheduler won't put anything here.) You taint a node when it's reserved for a purpose:
+
+- a node with **special hardware** reserved for special workloads,
+- a **GPU** node reserved for AI/ML jobs,
+- a node whose DB only accepts connections from specific IPs.
+
+```bash
+kubectl taint nodes ip-192-168-1-236.ec2.internal hardware=gpu:NoExecute
+```
+
+The effect after the colon decides how aggressive it is:
+
+| Effect | Meaning |
+|--------|---------|
+| **NoSchedule** | Don't schedule **new** pods here |
+| **NoExecute** | Also **evict** pods already running here |
+
+A pod gets past a taint only if it carries a matching **toleration** — the *VIP cabin / VIP pass* pairing. The taint is the roped-off cabin; the toleration is the pass that lets you in.
+
+The subtle part interviewers probe:
+
+> **A toleration only *permits*, it does not *place*.** With 3 nodes and 1 tainted, normal pods see 2 usable nodes. Give a pod a toleration and it now sees all 3 — the tainted one is merely *allowed*, not chosen. So to actually **force** a pod onto a tainted node you need **both**: a **toleration** (to be let in) *and* a **nodeSelector / affinity** (to be pointed there).
+
+### 3. Node affinity — nodeSelector with options
+
+When one label isn't enough — you want *"zone `us-east-1c` **or** `us-east-1a`, and prefer SSD nodes"* — use **nodeAffinity**. Two flavours, and the long names decode cleanly once you split them at "During":
+
+| Rule | During **scheduling** | During **execution** |
+|------|----------------------|----------------------|
+| `requiredDuringSchedulingIgnoredDuringExecution` | **Won't schedule** unless the node matches (hard) | Label changes later → **ignored**, pod keeps running |
+| `preferredDuringSchedulingIgnoredDuringExecution` | **Tries** to match; if nothing matches, schedules anywhere (soft) | Same — ignored once running |
+
+The `IgnoredDuringExecution` half is the key promise: **once a pod is placed and running, relabelling the node has no effect on it.** Kubernetes enforces the rule at *scheduling* time only — it won't yank a happily-running pod because a label drifted. (A stricter `RequiredDuringExecution` was planned but never shipped, which is why every rule name ends in `Ignored…`.)
+
+### 4. Pod affinity / anti-affinity — placement relative to *other* pods
+
+Node affinity targets nodes; **pod affinity targets other pods.** The question changes from *"which node?"* to *"which pods do I want to sit with — or avoid?"*
+
+- **Pod affinity** — *co-locate.* If `pod-a` is on `node-1`, schedule `pod-b` on `node-1` too (e.g. an app pod next to its cache for low latency).
+- **Pod anti-affinity** — *spread apart.* If `pod-a` is on `node-1`, keep `pod-b` off it — push it to `node-2` or `node-3`.
+
+Anti-affinity is the one that matters for resilience. Give every replica of `app: store` anti-affinity against its own label and Kubernetes fans them out:
+
+```text
+replica-1 → node-1
+replica-2 → node-2
+replica-3 → node-3
+```
+
+Now one node failure costs you **one** replica, not the whole service. This is exactly how you'd spread the pods of a StatefulSet database across nodes so a single node loss can't take down the cluster.
+
+### Choosing between them
+
+| You want to… | Use |
+|--------------|-----|
+| Pin to one specific label, no fallback | **nodeSelector** |
+| Reserve a node so nothing lands there unless invited | **taint** (+ toleration on the guests) |
+| Match nodes by several labels, hard *or* soft | **node affinity** |
+| Place pods relative to other pods (together / apart) | **pod (anti-)affinity** |
+
+The distinction that ties it together: **taints are the node pushing pods away; affinity is the pod pulling itself toward (or away from) something.** `nodeSelector` and node affinity choose by *node label*; pod affinity chooses by *neighbouring pod*.
+
+---
+
+## Helm — Templating and Packaging Manifests
+
+By now every roboshop service is a folder of static YAML. Two problems show up the moment you run more than one environment:
+
+- **Values are baked into the manifest.** Dev wants 1 replica, prod wants 5 — but `replicas: 5` is hard-coded, so you either edit the file before every deploy or keep two near-identical copies.
+- **There's no package to install.** To stand up the EBS CSI driver or Prometheus you'd apply a dozen inter-dependent manifests by hand and hope you got the order right.
+
+**Helm** solves both. It's described two ways, and they're really the same idea from two sides:
+
+1. **A package manager for Kubernetes** — install a whole application (many resources) with one command, like `dnf install nginx` on Linux.
+2. **A templating engine for manifests** — keep **placeholders** in the YAML and supply the **values at runtime**.
+
+This mirrors the split we started with: *build the image* (open-source nginx/mongo/node…) → **Docker**; *run the image* (manifests) → Kubernetes; **package and parameterise those manifests** → Helm.
+
+```bash
+curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4
+chmod 700 get_helm.sh && ./get_helm.sh
+```
+
+### Anatomy of a chart
+
+A **chart** is just a directory with three parts:
+
+| Piece | Role |
+|-------|------|
+| **`Chart.yaml`** | Chart metadata — `name`, `version`, `apiVersion`, `description`, `appVersion` |
+| **`templates/`** | The manifests, with **placeholders** instead of hard-coded values |
+| **`values.yaml`** | The **default values** those placeholders resolve to |
+
+The templating is plain `{{ .Values.<path> }}` referring into `values.yaml`. From the teaching `nginx` chart:
+
+```yaml
+# templates/deployment.yaml
+spec:
+  replicas: {{ .Values.deployment.replicas }}
+  ...
+        image: nginx:{{ .Values.deployment.imageVersion }}
+# templates/service.yaml
+  type: {{ .Values.service.type }}
+```
+
+```yaml
+# values.yaml — the defaults
+deployment:
+  replicas: 4
+  imageVersion: 1.31.3-alpine
+service:
+  type: ClusterIP
+```
+
+At install time Helm **renders** the templates against the values and hands plain manifests to the cluster. The `roboshop-helm/catalogue` chart does the same for a real backend service — `image: "{{ .Values.deployment.imageRepo }}:{{ .Values.deployment.imageVersion }}"` — so bumping the image is a one-line values change, not a manifest edit.
+
+**`Chart.yaml` carries two versions, and interviewers like the distinction:**
+
+```yaml
+apiVersion: v2
+name: nginx
+version: 0.1.3          # the CHART's version — bump when you change templates/values
+appVersion: 1.31.3-alpine  # the APP inside — the image version you're shipping
+```
+
+`version` tracks your packaging; `appVersion` tracks the software being packaged. They move independently.
+
+### The payoff: one chart, many environments
+
+This is the reason Helm exists in a CI/CD pipeline. **The image is identical across environments — only the *configuration* differs** — so you keep one set of templates and one values file per environment:
+
+```
+values.yaml       # sensible defaults
+values-dev.yaml   # deployment.replicas: 1
+values-prod.yaml  # deployment.replicas: 5
+```
+
+The pipeline then does the same thing in each stage, only swapping the values file:
+
+```bash
+# dev stage
+#   authenticate to the dev cluster, then:
+helm upgrade --install catalogue . -f values-dev.yaml
+
+# prod stage
+#   authenticate to the prod cluster, then:
+helm upgrade --install catalogue . -f values-prod.yaml
+```
+
+`upgrade --install` is the idempotent form — **install if it's the first time, upgrade if it already exists** — so the same command line is safe in every run.
+
+### Lifecycle commands
+
+| Command | Purpose |
+|---------|---------|
+| `helm install <name> .` | First-time install of the chart in this directory |
+| `helm upgrade <name> .` | Apply changes to an already-installed release |
+| `helm upgrade --install <name> .` | Do whichever applies — the CI/CD default |
+| `helm list` | Show installed releases |
+| `helm history <name>` | Revision history of a release (enables rollback) |
+| `--set deployment.replicas=10` | Override a single value inline, without editing a file |
+
+### The other face: installing community charts
+
+Authoring your own chart is one half; **consuming** public charts is the other, and it's the exact Linux-package-manager workflow. On a server you add a repo to `/etc/yum.repos.d/` then `dnf install nginx`. With Helm you add a chart repo, then install:
+
+```bash
+helm repo add aws-ebs-csi-driver https://kubernetes-sigs.github.io/aws-ebs-csi-driver
+helm repo update
+
+helm upgrade --install ebs-csi-driver \
+    --namespace kube-system --version 2.62.0 \
+    aws-ebs-csi-driver/aws-ebs-csi-driver
+```
+
+That single command is the EBS CSI driver from the storage sessions — dozens of manifests, packaged. The same pattern installs a full monitoring stack:
+
+```bash
+helm install prometheus-stack prometheus-community/kube-prometheus-stack \
+  --namespace monitoring --create-namespace
+```
+
+So Helm is where the course's two threads meet: your own roboshop services become parameterised charts, and the platform pieces you depend on (CSI drivers, Prometheus) arrive as someone else's charts — both installed the same way.
 
 ---
 
@@ -1479,10 +1687,29 @@ curl -sS https://webinstall.dev/k9s | bash
 | HPA prerequisite | Requires `resources.requests` — utilisation is a **% of requests**, else no denominator |
 | `averageUtilization: 50` | Keep average CPU at ~50% of the **requested** CPU (90% = 90 out of 100) |
 | What to autoscale | Deployments (stateless); not DB StatefulSets — replicas there mean cluster joins |
-| **Taints + tolerations** | The **node repels** pods; only pods tolerating the taint may land |
-| **Node affinity** | The **pod chooses** which nodes it wants (`nodeSelector` is the simple form) |
-| **Pod (anti-)affinity** | The pod chooses which **other pods** to sit with / avoid — spreads DB replicas |
 | **k9s** | Terminal UI for the cluster; far faster than repeated `kubectl get/describe` |
+| **Selectors** | Overriding the scheduler to run pods on the nodes you choose |
+| Node labels | EKS auto-labels nodes (zone, instance-type, `capacityType=SPOT`); add your own with `kubectl label node` |
+| **nodeSelector** | One label the node **must** have; no match → pod stuck **`Pending`** (hard, blunt) |
+| **Taint** | The **node repels** pods (*painted/polluted*) — reserve GPU/special/DB nodes |
+| **Toleration** | The pod's *VIP pass* to a tainted node — **permits**, doesn't **place** |
+| NoSchedule vs NoExecute | Block new pods / block new **and evict** running ones |
+| Force onto a tainted node | Needs **both** a toleration (let in) **and** a nodeSelector/affinity (point there) |
+| **Node affinity** | nodeSelector with multiple labels + hard/soft; `required…` vs `preferred…` |
+| `IgnoredDuringExecution` | Rule checked at **schedule** time only — relabelling a running pod's node does nothing |
+| **Pod affinity** | Co-locate with another pod (app next to its cache) |
+| **Pod anti-affinity** | Spread pods apart — one replica per node, so a node loss costs one replica |
+| Taint vs affinity | **Taint = node pushes away; affinity = pod pulls toward** |
+| **Helm** | Package manager for Kubernetes **+** a templating engine for manifests |
+| Chart layout | `Chart.yaml` (metadata) + `templates/` (manifests w/ placeholders) + `values.yaml` (defaults) |
+| Templating syntax | `{{ .Values.deployment.replicas }}` reads into `values.yaml` |
+| `version` vs `appVersion` | The **chart's** package version vs the **app/image** version inside — move independently |
+| One chart, many envs | Same image everywhere; only values differ — `values-dev.yaml` / `values-prod.yaml` |
+| **`helm upgrade --install`** | Idempotent — install first time, upgrade after; the CI/CD default |
+| `-f values-dev.yaml` | Supply an environment's values at deploy time |
+| `--set key=value` | Override one value inline without editing a file |
+| `helm list` / `history` | Show installed releases / a release's revisions (for rollback) |
+| Community charts | `helm repo add` + `helm upgrade --install` — like `dnf install`; e.g. EBS CSI driver, kube-prometheus-stack |
 | **startupProbe** | Has it booted? Runs **once**; buys slow starters time |
 | **readinessProbe** | Ready for traffic? Fails → **removed from Service endpoints** (no restart) |
 | **livenessProbe** | Still alive? Fails → **pod restarted** |
