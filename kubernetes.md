@@ -1596,6 +1596,156 @@ So Helm is where the course's two threads meet: your own roboshop services becom
 
 ---
 
+## Service Accounts — Giving Pods an AWS Identity
+
+Everything so far has been about a pod talking to **other pods**. But a pod often needs to talk to the **cloud** — a catalogue pod reading a database password out of AWS Secrets Manager, a backup pod writing to S3, a pod describing EBS volumes. That is an authorisation question: *who is this pod, and what is it allowed to do in AWS?* The answer is a **Service Account**.
+
+A ServiceAccount is the **identity a pod runs as inside Kubernetes** — the pod equivalent of a Linux user. It is a namespaced resource, and the rule to remember is:
+
+> Whenever you create a namespace, Kubernetes auto-creates a **`default`** service account in it with **zero permissions**, and every pod that doesn't name a service account runs as that default.
+
+So your pods already have an identity — it just can't do anything. To let a pod perform CRUD on AWS resources, you attach real AWS permissions to that identity. On EKS the mechanism is **IRSA — IAM Roles for Service Accounts** — which lets a Kubernetes service account *become* an AWS IAM role.
+
+### The four steps
+
+The mental model from the session:
+
+1. **Create the service account** (the pod's identity).
+2. **Create an IAM role** with the IAM permissions you want to grant.
+3. **Map the IAM role to the service account** through an **annotation** on the SA.
+4. **Run the pod with that service account** (`serviceAccountName:`).
+
+Step 3 is exactly why annotations exist — recall that annotations are *metadata for external systems*. The IAM role ARN is AWS metadata, so it belongs in an annotation, not a label.
+
+### OIDC — the trust bridge
+
+Before any of this works, the cluster needs an **OIDC provider**. OIDC (OpenID Connect) is a token-based way to **trust a third-party application** — here, AWS trusts tokens issued by your Kubernetes cluster, which is what lets a pod's SA token be exchanged for AWS credentials. You associate it once per cluster:
+
+```bash
+eksctl utils associate-iam-oidc-provider --cluster roboshop --approve
+```
+
+Without this, AWS has no reason to believe the token a pod presents actually came from your cluster.
+
+### Creating the service account with its permissions
+
+`eksctl` does steps 1–3 in a single command — it creates the SA, creates the IAM role, and wires them together with the annotation:
+
+```bash
+eksctl create iamserviceaccount \
+  --cluster=roboshop \
+  --namespace=roboshop \
+  --name=roboshop-secret-reader \
+  --attach-policy-arn=arn:aws:iam::160885265516:policy/RoboShopMySQLSecretReader \
+  --approve
+```
+
+That says: in the `roboshop` namespace, make a service account called `roboshop-secret-reader`, and behind it stand an IAM role that carries the `RoboShopMySQLSecretReader` policy.
+
+### Running a pod as that service account
+
+Now step 4 — the pod just names the SA (from `k8-rbac/06-pod.yaml`):
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: aws-cli
+  namespace: roboshop
+spec:
+  serviceAccountName: roboshop-secret-reader   # ← run as this identity
+  containers:
+  - name: aws-cli
+    image: amazon/aws-cli
+    command: ["sleep", "1000"]
+```
+
+Because this pod runs as `roboshop-secret-reader`, and that SA is mapped to an IAM role that can read the secret, the AWS CLI inside it succeeds **with no keys baked in** — it picks up temporary credentials automatically:
+
+```bash
+aws secretsmanager get-secret-value --secret-id roboshop/dev/mysql_root_password
+```
+
+That is the whole point of IRSA: **no long-lived AWS access keys in the pod, no secrets in the image** — just an identity that AWS trusts, scoped to exactly the permissions the pod needs.
+
+---
+
+## Ingress — One Load Balancer, Many Services
+
+`LoadBalancer` services solved *exposing a pod to the internet* — but they solve it one service at a time. Each `type: LoadBalancer` provisions its **own** cloud load balancer. Ten services means ten load balancers, ten bills, ten DNS records, and no way to say "route by URL." That doesn't scale. **Ingress** is the answer: **one** smart load balancer in front of **many** services, routing by the URL.
+
+### CLB vs ALB — why we route on the URL
+
+- **Classic Load Balancer (CLB)** — legacy, dumb: it forwards traffic but can't read the request.
+- **Application Load Balancer (ALB)** — intelligent, layer 7: it can **read the URL and decide** where to send the request. Ingress on EKS uses the ALB.
+
+Because the ALB reads the URL, it supports two routing styles:
+
+| Routing | Example | Goes to |
+|---------|---------|---------|
+| **Host-based** | `app1.daws90s.shop` | app1 |
+| | `app2.daws90s.shop` | app2 |
+| **Path/context-based** | `daws90s.shop/app1` | app1 |
+| | `daws90s.shop/app2` | app2 |
+
+This is the same trick a site like `m.facebook.com` uses — one front door, the hostname/path decides the destination.
+
+### The ALB request chain
+
+An ALB routes through a fixed chain of pieces — you configure multiple rules, each pointing at its own target group:
+
+```
+ALB → Listener → Rule → Target group → VM (instance)   ← traditional
+ALB → Listener → Rule → Target group → pod (IP)         ← with Ingress
+```
+
+The key difference in Kubernetes: the target group points at **pod IPs directly** (`target-type: ip`), not at nodes — traffic goes straight to the pod.
+
+### Ingress vs the Ingress Controller
+
+This is the distinction interviews probe:
+
+- The **Ingress** resource is just the **rules** — "`app1.daws90s.shop` → the `app-1` service." It's a YAML object and does nothing on its own.
+- The **Ingress Controller** is the **program running in the cluster** that reads those rules and actually builds the infrastructure. On EKS this is the **AWS Load Balancer Controller** — it watches Ingress resources and calls AWS to create the ALB, listeners, rules, and target groups.
+
+> Ingress exposes your pods to the outside world through a load balancer, listener, rules and target groups — and it does it by asking the AWS Load Balancer Controller to create those AWS resources for you.
+
+No controller, no ALB — the Ingress resource just sits there ignored.
+
+### A real Ingress (from `k8s-ingress/app1`)
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-1
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:...   # HTTPS cert
+    alb.ingress.kubernetes.io/target-type: ip                    # target the pods
+    alb.ingress.kubernetes.io/group.name: roboshop               # share ONE ALB
+spec:
+  ingressClassName: alb
+  rules:
+  - host: "app1.daws90s.shop"        # host-based routing
+    http:
+      paths:
+      - pathType: Prefix
+        path: "/"
+        backend:
+          service:
+            name: app-1              # → the app-1 Service → app-1 pods
+            port:
+              number: 80
+```
+
+Note where the configuration lives: everything ALB-specific is an **annotation** (metadata for an external system — the controller), while the routing itself is in `spec.rules`. `app2` is an identical file with `app2.daws90s.shop` → `app-2`.
+
+The one annotation worth calling out is **`group.name: roboshop`**. Both `app-1` and `app-2` carry the same group name, so the controller puts **both** Ingresses behind a **single shared ALB** instead of one per app — the same cost lesson as before, now solved: one load balancer, many services, routed by hostname.
+
+---
+
 ## Quick Reference
 
 | Concept | One-liner |
@@ -1710,6 +1860,20 @@ So Helm is where the course's two threads meet: your own roboshop services becom
 | `--set key=value` | Override one value inline without editing a file |
 | `helm list` / `history` | Show installed releases / a release's revisions (for rollback) |
 | Community charts | `helm repo add` + `helm upgrade --install` — like `dnf install`; e.g. EBS CSI driver, kube-prometheus-stack |
+| **ServiceAccount** | The identity a pod runs as; a pod's "Linux user" (namespaced) |
+| `default` SA | Auto-created per namespace with **zero permissions**; pods use it unless told otherwise |
+| **IRSA** | IAM Roles for Service Accounts — a K8s SA *becomes* an AWS IAM role |
+| IRSA steps | create SA → create IAM role → map via **annotation** → run pod with `serviceAccountName:` |
+| **OIDC provider** | Token trust bridge so AWS believes the pod's SA token; `eksctl utils associate-iam-oidc-provider` |
+| `eksctl create iamserviceaccount` | One command: makes the SA, the IAM role, and the annotation linking them |
+| Why IRSA | **No AWS keys in the pod / no secrets in the image** — temporary creds via the SA |
+| **Ingress** | The **rules** — "host/path → service"; YAML only, does nothing alone |
+| **Ingress Controller** | The program that reads Ingress rules and builds the real LB; on EKS = **AWS Load Balancer Controller** |
+| Why Ingress | **One** smart LB for **many** services, vs `LoadBalancer` = one LB per service |
+| **CLB vs ALB** | Legacy/dumb forwarder vs layer-7 that **reads the URL and decides** |
+| Host vs path routing | `app1.daws90s.shop` → app1 / `daws90s.shop/app1` → app1 |
+| ALB chain | ALB → Listener → Rule → Target group → **pod IP** (`target-type: ip`) |
+| `group.name` | Same group on many Ingresses → they **share one ALB** (not one per app) |
 | **startupProbe** | Has it booted? Runs **once**; buys slow starters time |
 | **readinessProbe** | Ready for traffic? Fails → **removed from Service endpoints** (no restart) |
 | **livenessProbe** | Still alive? Fails → **pod restarted** |
