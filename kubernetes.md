@@ -1746,6 +1746,259 @@ The one annotation worth calling out is **`group.name: roboshop`**. Both `app-1`
 
 ---
 
+## The AWS Load Balancer Controller — Installing the Engine
+
+The Ingress section said the **AWS Load Balancer Controller** is the program that turns Ingress rules into a real ALB. But it doesn't come with EKS — you install it, and installing it is itself a lesson in everything before it: **it's just a pod running in `kube-system` that needs AWS permissions, so it gets those permissions through IRSA** — the exact pattern from the Service Accounts section, now applied to a system component instead of your app.
+
+Think of the controller as the **driver** that lets Kubernetes reach out and touch EC2 and Elastic Load Balancing on your behalf. No driver, no ALB.
+
+### The four setup steps
+
+**1. Associate the OIDC provider** — the trust bridge (same as IRSA) so the controller's ServiceAccount can assume an IAM role:
+
+```bash
+eksctl utils associate-iam-oidc-provider \
+  --region us-east-1 \
+  --cluster roboshop-dev \
+  --approve
+```
+
+**2. Give the controller an identity (IRSA)** — a ServiceAccount named `aws-load-balancer-controller` in `kube-system`, bound to a policy that lets it manage load balancers:
+
+```bash
+eksctl create iamserviceaccount \
+  --cluster=roboshop-dev \
+  --namespace=kube-system \
+  --name=aws-load-balancer-controller \
+  --attach-policy-arn=arn:aws:iam::160885265516:policy/AWSLoadBalancerControllerIAMPolicy \
+  --override-existing-serviceaccounts \
+  --region us-east-1 \
+  --approve
+```
+
+**3. Add the Helm repo** — the controller ships as a community chart (the `helm repo add` + install pattern from the Helm section):
+
+```bash
+helm repo add eks https://aws.github.io/eks-charts
+helm repo update
+```
+
+**4. Install the controller, reusing the SA** — note `serviceAccount.create=false`: we already made the SA in step 2 with its IAM role attached, so the chart must **use** it, not create a fresh one with no permissions:
+
+```bash
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system \
+  --set clusterName=roboshop-dev \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=aws-load-balancer-controller
+```
+
+That last flag is the whole trick: the identity (step 2) and the software (step 4) are created separately, then wired together by **name**. Let the chart create its own SA and it comes up with zero AWS permissions — the controller installs fine but silently can't build a single ALB.
+
+---
+
+## Gateway API — When Ingress Isn't Enough
+
+Ingress works, but in practice it hurts — and the pain is structural, not cosmetic. The community's answer is the **Gateway API**, and the reason it exists is worth understanding before the YAML.
+
+### Why Ingress is being retired
+
+- **It's all annotations.** Every ALB behaviour — scheme, cert ARN, target type, listener ports, grouping — is a string in an annotation. The API server never validates it. **One typo or one missing annotation apply cleanly and then fail silently at runtime** — nothing tells you why.
+- **Admin and developer share one object.** Operator concerns (cert ARN, scheme, tags) and app concerns (host, path, backend) live in the *same* Ingress resource. Both roles must touch the same file, so a change by one can break the other — a built-in dependency and a source of confusion.
+- **Little real control over the ALB.** You can only express what an annotation happens to support.
+
+Those three add up to Ingress being effectively **deprecated** for serious use.
+
+### The Gateway API's core idea: split admin from developer
+
+Gateway API breaks that one overloaded Ingress object into **five resources, cleanly divided by who owns them.**
+
+**Administrator resources** (the platform team owns these — the *infrastructure*):
+
+| Resource | Job |
+|----------|-----|
+| **GatewayClass** | Tells Kubernetes *which* load balancer to use — ALB or NLB |
+| **LoadBalancerConfiguration** | The LB's shape — HTTP/HTTPS, ports, TLS certificates |
+| **Gateway** | Wires the GatewayClass to the LoadBalancerConfiguration, and defines the **listeners** (ports/hostnames) |
+
+**Developer resources** (the app team owns these — the *routing*):
+
+| Resource | Job |
+|----------|-----|
+| **TargetGroupConfiguration** | Creates the target group and its target type (`ip`) |
+| **HTTPRoute** | Adds the routing rule — "this host → my service" — onto the Gateway's listener |
+
+The admin picks the load balancer, terminates TLS, and opens the listeners **once**. Every app team then just attaches an `HTTPRoute` to that shared Gateway. Neither side edits the other's files.
+
+### The real resources (from `k8s-ingress/gateway`)
+
+The **admin** stands up the load balancer once — GatewayClass → LoadBalancerConfiguration → Gateway:
+
+```yaml
+# 01 GatewayClass — "use the AWS ALB"
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: aws-alb
+spec:
+  controllerName: gateway.k8s.aws/alb
+---
+# 02 LoadBalancerConfiguration — scheme + HTTPS cert
+apiVersion: gateway.k8s.aws/v1
+kind: LoadBalancerConfiguration
+metadata:
+  name: roboshop-alb
+  namespace: roboshop
+spec:
+  scheme: internet-facing
+  ipAddressType: ipv4
+  listenerConfigurations:
+  - protocolPort: HTTPS:443
+    certificates:
+    - arn:aws:acm:us-east-1:...:certificate/72f4e658-...
+---
+# 03 Gateway — join the two above, open the listeners
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: roboshop
+  namespace: roboshop
+spec:
+  gatewayClassName: aws-alb
+  infrastructure:
+    parametersRef:
+      group: gateway.k8s.aws
+      kind: LoadBalancerConfiguration
+      name: roboshop-alb
+  listeners:
+  - name: https
+    port: 443
+    protocol: HTTPS
+    hostname: "*.daws90s.shop"
+    allowedRoutes:
+      namespaces:
+        from: Same
+```
+
+The **developer** just points their app at that Gateway — a target group config plus an `HTTPRoute`:
+
+```yaml
+# 05 TargetGroupConfiguration — target the pods by IP
+apiVersion: gateway.k8s.aws/v1
+kind: TargetGroupConfiguration
+metadata:
+  name: app1
+  namespace: roboshop
+spec:
+  targetReference:
+    name: app1
+    kind: Service
+  defaultConfiguration:
+    targetType: ip
+---
+# 06 HTTPRoute — "app1.daws90s.shop → the app1 Service"
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: app1
+  namespace: roboshop
+spec:
+  hostnames:
+  - app1.daws90s.shop
+  parentRefs:              # attach to the admin's Gateway listener
+  - kind: Gateway
+    name: roboshop
+    sectionName: https
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - kind: Service
+      name: app1
+      port: 80
+      weight: 1
+```
+
+Compare with Ingress: there, `app1` and `app2` each copy-pasted the cert ARN, scheme, and every ALB annotation into their own file. Here the cert lives in exactly **one** admin file; `app2` is just another `HTTPRoute` + `TargetGroupConfiguration` pointing at the same Gateway. One source of truth.
+
+### The three wins
+
+1. **Role separation** — admin and developer resources never clash; each team owns its own files.
+2. **Independent change** — the app team ships routing changes without touching (or waiting on) the platform team, and vice versa.
+3. **Painless provider migration** — move EKS → AKS/GKE and only the admin swaps the GatewayClass and vendor CRDs. **The developers' `HTTPRoute`s don't change at all** — the exact opposite of Ingress, where every AWS-only annotation had to be rewritten in every app file.
+
+The CRDs come in two installs — the **standard** Gateway API CRDs (vendor-neutral: GatewayClass, Gateway, HTTPRoute) and the **AWS-specific** ones (LoadBalancerConfiguration, TargetGroupConfiguration). That two-layer split is the migration story made concrete: standard routes on top, swappable vendor layer underneath.
+
+> **A question raised in team meetings:** if EKS can create EC2/ELB resources, *should* it? An alternative is to build the ALB and target groups with **Terraform** and let EKS only register pods as targets — keeping infra creation in the IaC pipeline where it's reviewed and versioned. (The repo's `terraform/` folder hints at exactly this pattern.)
+
+---
+
+## Deployment Strategies — Recreate, Rolling, Blue-Green & Beyond
+
+How you ship a new version is a design decision with real trade-offs: downtime, resource cost, rollback speed, and blast radius. Interviews love this comparison.
+
+| Strategy | How it works | Downtime | Trade-off |
+|----------|-------------|----------|-----------|
+| **Recreate** | Stop the old, deploy the new, start it | **Guaranteed downtime** | Simplest; unacceptable for prod |
+| **Rolling update** | Add a new pod, remove an old one, gradually | Zero | **Two versions run at once** — the app must tolerate it |
+| **Blue-Green** | Two full environments; flip the switch | Zero | **Instant rollback**, but **double the resources** |
+| **Canary** | Release to a few users, watch, then widen | Zero | Safe, but slower and needs good monitoring |
+| **A/B testing** | Route specific users (geo/device) to v2 | Zero | For *testing a change on a segment*, not just shipping |
+| **Shadow** | Copy v1's live traffic to v2 silently | Zero | v2 gets real load with **no user impact** (no real payments) |
+
+### Blue-Green in depth
+
+Rolling update's weakness is that **two versions serve traffic simultaneously** — developers have to make v1 and v2 coexist. Blue-Green removes that: only **one** version is ever live. You keep two complete environments — **blue** and **green** — and cut over all at once by **changing which pods the main Service selects.**
+
+The mechanism is pure label-selector magic. Both deployments carry `app: nginx` but differ on `version:`; the main Service picks one version:
+
+```yaml
+# 01-blue-d.yaml — the blue Deployment
+metadata:
+  name: nginx-blue
+  labels: { version: blue, app: nginx }
+spec:
+  replicas: 4
+  selector:
+    matchLabels: { version: blue, app: nginx }
+```
+
+```yaml
+# 02-main-s.yaml — the live Service points at blue
+kind: Service
+metadata: { name: nginx }
+spec:
+  type: LoadBalancer
+  selector:
+    app: nginx
+    version: blue        # ← the switch lives here
+```
+
+**Releasing green** — deploy `nginx-green` (`version: green`) alongside blue, and expose it through a separate **preview Service** so you can test it privately before any user sees it. Happy with green? Flip the main Service's selector — traffic moves instantly with **zero downtime**:
+
+```bash
+kubectl patch svc nginx -p '{"spec":{"selector":{"version":"green"}}}'
+```
+
+**Reclaiming resources** — Blue-Green's cost is running two full environments. Once green is live and stable, scale the standby (blue) to zero so you're not paying for idle pods:
+
+```bash
+kubectl patch deployment nginx-blue -p '{"spec":{"replicas":0}}'
+```
+
+**Rollback is trivial** — this is the payoff. If green misbehaves, the previous version is already sitting there. Scale it back up and flip the selector home:
+
+```bash
+kubectl patch deployment nginx-green -p '{"spec":{"replicas":4}}'   # wake the standby
+kubectl patch svc nginx -p '{"spec":{"selector":{"version":"green"}}}'
+```
+
+The whole magic is in **switching the route of the main Service** — the deployments never change, only which one the Service points at. That's what makes the cutover instant and the rollback a one-liner.
+
+---
+
 ## Quick Reference
 
 | Concept | One-liner |
@@ -1874,6 +2127,26 @@ The one annotation worth calling out is **`group.name: roboshop`**. Both `app-1`
 | Host vs path routing | `app1.daws90s.shop` → app1 / `daws90s.shop/app1` → app1 |
 | ALB chain | ALB → Listener → Rule → Target group → **pod IP** (`target-type: ip`) |
 | `group.name` | Same group on many Ingresses → they **share one ALB** (not one per app) |
+| **AWS LB Controller** | A pod in `kube-system` that turns Ingress/Gateway into a real ALB; the "driver" to EC2/ELB |
+| Controller install | OIDC → `iamserviceaccount` (IRSA) → `helm repo add eks` → `helm install` |
+| `serviceAccount.create=false` | Reuse the IRSA SA made by eksctl; let Helm make its own and it has **zero AWS perms** |
+| **Why Ingress is retired** | All-annotation (silent typos) + admin & dev share one object + little ALB control |
+| **Gateway API** | Ingress's successor — splits one object into 5 resources by **who owns them** |
+| **GatewayClass** | Admin: which LB — ALB or NLB |
+| **LoadBalancerConfiguration** | Admin: LB shape — HTTP/HTTPS, ports, TLS cert |
+| **Gateway** | Admin: joins GatewayClass + LBConfig, opens the **listeners** |
+| **TargetGroupConfiguration** | Developer: creates the target group + target type (`ip`) |
+| **HTTPRoute** | Developer: attaches "host → service" routing onto a Gateway listener |
+| Gateway wins | Role separation + teams change independently + provider migration leaves routes untouched |
+| Gateway CRDs | Standard (vendor-neutral) + AWS-specific — the swappable-vendor layer made real |
+| **Recreate** | Stop old → deploy new → start; **guaranteed downtime** |
+| **Rolling update** | Add new / drop old gradually; zero downtime but **two versions live at once** |
+| **Blue-Green** | Two full envs; flip the Service selector — zero downtime + instant rollback, **double resources** |
+| Blue-Green switch | `kubectl patch svc nginx -p '{"spec":{"selector":{"version":"green"}}}'` — the magic is in the route |
+| Blue-Green cost fix | Scale the standby to `replicas: 0`; wake it on rollback |
+| **Canary** | Release to a few users, monitor, then widen |
+| **A/B testing** | Route a segment (geo/device) to v2 — testing a change, not just shipping |
+| **Shadow** | Copy live v1 traffic to v2 silently — real load, no user impact |
 | **startupProbe** | Has it booted? Runs **once**; buys slow starters time |
 | **readinessProbe** | Ready for traffic? Fails → **removed from Service endpoints** (no restart) |
 | **livenessProbe** | Still alive? Fails → **pod restarted** |
