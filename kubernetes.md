@@ -1999,6 +1999,198 @@ The whole magic is in **switching the route of the main Service** — the deploy
 
 ---
 
+## High Availability — Spreading Pods Across Zones and Nodes
+
+Running many replicas only helps if they aren't all sitting in the same place. Left to itself, the scheduler can pile every replica of a Deployment onto **one node** — and the moment that node (or its zone) dies, your whole app goes with it. High availability is about surviving that loss, and it comes in two layers:
+
+- **Node-level HA** — survive one *node* failing → keep replicas on **different nodes**.
+- **Zone-level HA** — survive one *availability zone* failing → keep replicas across **different zones**.
+
+AWS's own recommendation for EKS is **3 zones, and at least 2 nodes per zone** — six nodes total. Two zones gives you zone-level HA; two nodes in each gives you node-level HA within a zone. The reason for **odd numbers of zones** is quorum: with an even split a network partition can't decide who's the majority.
+
+### How replicas fill nodes
+
+The mental model the session drilled is just "how do N pods spread over M nodes." With 3 nodes:
+
+```
+1 pod  -> 1-0-0  -> unsafe   (all eggs in one basket)
+2 pods -> 1-1-0  -> partly safe
+3 pods -> 1-1-1  -> safe
+6 pods -> 2-2-2  -> safe and balanced
+```
+
+With an odd replica count there's always a 1-pod skew between the busiest and emptiest node — that's expected, not a bug. The goal isn't a perfectly even count, it's that **no single node or zone holds all of them**.
+
+### TopologySpreadConstraints — the tool that enforces it
+
+`topologySpreadConstraints` tells the scheduler to spread matching pods evenly across a *topology domain* (a zone, or a node). Three fields do the work:
+
+```yaml
+# k8s-ha/manifest.yaml — nginx Deployment, replicas: 7
+spec:
+  topologySpreadConstraints:
+  - maxSkew: 1                                   # max allowed gap between the fullest and emptiest domain
+    topologyKey: topology.kubernetes.io/zone     # spread across ZONES
+    whenUnsatisfiable: DoNotSchedule             # hard rule — leave the pod Pending rather than break balance
+    labelSelector:
+      matchLabels:
+        project: roboshop                         # which pods to count when balancing
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/node      # AND spread across NODES
+    whenUnsatisfiable: ScheduleAnyway             # soft rule — prefer balance, but schedule anyway if you must
+    labelSelector:
+      matchLabels:
+        project: roboshop
+```
+
+- **`maxSkew`** — the biggest allowed difference in pod count between the most- and least-loaded domain. `1` means "keep them within one of each other."
+- **`topologyKey`** — *what* to spread over: `topology.kubernetes.io/zone` for zone-level, `.../node` (or `kubernetes.io/hostname`) for node-level. These labels are put on nodes automatically by EKS.
+- **`whenUnsatisfiable`** — what to do when the constraint *can't* be met: **`DoNotSchedule`** (hard — the pod stays `Pending` rather than clump) or **`ScheduleAnyway`** (soft — treat balance as a preference).
+
+The example uses both at once: **zone spread is hard, node spread is soft**. Even distribution across zones is worth leaving a pod pending for; within a zone, getting the pod running wins over perfect node balance.
+
+> Taint/affinity vs TopologySpread: affinity says *which* node a pod may go on; TopologySpread says *how evenly* the group of pods is distributed. They answer different questions.
+
+## PodDisruptionBudget — Protecting Availability During Voluntary Disruptions
+
+TopologySpread protects you when pods are *placed*. A **PodDisruptionBudget (PDB)** protects you when someone tries to *take pods away* on purpose. The key word is **voluntary disruption** — things an operator initiates:
+
+- Draining a node to **upgrade the EKS cluster** (`kubectl drain` cordons then evicts).
+- The **cluster autoscaler** removing an under-used node.
+
+A PDB sets the **minimum that must stay running** while those evictions happen. If honouring an eviction would drop you below the floor, Kubernetes **blocks the drain** until it's safe:
+
+```yaml
+# k8s-ha/manifest.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: nginx
+spec:
+  minAvailable: "50%"          # never let fewer than half the replicas be running
+  selector:
+    matchLabels:
+      project: roboshop        # applies to the same pods
+```
+
+With 7 replicas and `minAvailable: 50%`, at least 4 must stay up — so a drain can evict at most 3 at a time and will wait for reschedules before taking more. You can also express the floor as an absolute number (`minAvailable: 4`) or from the other side (`maxUnavailable: 1`). Set the floor from your node/zone layout: on 2 nodes running 1-1, a 50% floor means neither node can be fully drained at once.
+
+**The crucial limit:** a PDB only guards **voluntary** disruptions. It does *nothing* for **involuntary** ones — a node crashing, hardware dying, someone force-deleting a pod. Those it can't stop; that's what TopologySpread and multiple replicas are for. The two work together: **spread constraints** survive the crash you didn't plan, **PDBs** survive the maintenance you did.
+
+## Cluster Networking — VPC-CNI, ENIs and Pod IPs
+
+On EKS, pod networking is handled by the **VPC-CNI** add-on — the plugin that wires pods into the cluster network. Its defining behaviour: **pods get a real IP straight from the VPC's CIDR pool**, the same address space as the EC2 nodes (e.g. `10.0.0.0/16`). This is what people mean by *"pods are first-class citizens"* on EKS — a pod's IP is routable from anywhere in the VPC, so you can reach a pod directly without any overlay/NAT hop.
+
+That convenience has a hard cost: **pod density is capped by IP addresses, not just CPU/RAM.** A node hands out pod IPs through its **Elastic Network Interfaces (ENIs)**, and both numbers are fixed per instance type:
+
+```
+pods per node ≈ (ENIs per instance × IPs per ENI) - 1     # minus 1, the node keeps one for itself
+
+t3.small : 3 ENIs × 4 IPs = 12 - 1 = 11 pods per node   → 2 nodes ≈ 22 pods
+m5.xlarge: 59 pod IPs per node                           → 2 nodes ≈ 118 pods
+```
+
+The consequence to remember for interviews: **you can run out of pod slots while still having spare CPU and memory.** If 100 pods each need an IP and your two nodes only expose ~118 between them, the next wave of apps forces you to add nodes purely for **IP capacity** — even though `kubectl top` shows plenty of headroom. Instance type is therefore a networking decision, not only a compute one.
+
+## Network Policies — Firewalls Between Pods
+
+A **namespace** is an isolated project space — but isolation there is only *organisational*, not *network*. By default, **if no NetworkPolicy exists in a namespace, all ingress and egress is allowed** — every pod can talk to every other pod, across namespaces included. A `NetworkPolicy` is the **pod-level firewall** that changes that.
+
+On EKS this isn't on out of the box — the VPC-CNI must be told to enforce policies:
+
+```bash
+aws eks update-addon \
+  --cluster-name roboshop-dev \
+  --addon-name vpc-cni \
+  --configuration-values '{"enableNetworkPolicy":"true"}'
+```
+
+The usual pattern is **default-deny, then allow what you need** — a whitelist. First, shut everything down in the namespace:
+
+```yaml
+# k8s-network/01-deny-ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: roboshop
+spec:
+  podSelector: {}          # {} = EVERY pod in the namespace
+  policyTypes:
+  - Ingress                # deny all incoming (no ingress rules listed = nothing allowed in)
+```
+
+Now nothing can reach any pod in `roboshop` — including pods *inside* the namespace. Then open precise holes. Let only **catalogue** and **cart** reach MongoDB, and only on its port:
+
+```yaml
+# k8s-network/02-mongodb.yaml
+spec:
+  podSelector:                       # THIS policy protects the mongodb pods
+    matchLabels:
+      component: mongodb
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:                   # allow FROM catalogue pods
+        matchLabels:
+          component: catalogue
+    - podSelector:                   # and FROM cart pods
+        matchLabels:
+          component: cart
+    ports:
+    - protocol: TCP
+      port: 27017                    # only on Mongo's port
+```
+
+Selectors can also reach **across namespaces**. To let a monitoring stack in another namespace scrape every pod's metrics port:
+
+```yaml
+# k8s-network/03-allow-monitoring.yaml
+spec:
+  podSelector: {}                    # applies to all roboshop pods
+  ingress:
+  - from:
+    - namespaceSelector:             # allow FROM any pod in a namespace labelled project=monitoring
+        matchLabels:
+          project: monitoring
+    ports:
+    - protocol: TCP
+      port: 9090
+```
+
+Two ideas to hold onto: **`podSelector: {}` means "all pods"** (empty = match everything), and **NetworkPolicies are additive** — they only ever *allow*; once a default-deny is in place, each policy punches a specific hole. There's no "deny this one thing" rule; you deny broadly and allow narrowly.
+
+## Kubernetes Architecture — Control Plane and Node Components
+
+Everything so far — Deployments, Services, HPAs — is a *request*. The architecture is the set of components that actually make those requests real. A cluster splits into the **Control Plane** (the brain, `master`) and the **Nodes** (the muscle, where pods run). On EKS, AWS runs and manages the control plane for you; you only own the nodes.
+
+### Control Plane
+
+| Component | Job |
+|-----------|-----|
+| **kube-apiserver** | The front door. *Every* request hits it first; it does **authentication + authorisation**, validates the object, then hands off to the right component. Nothing talks to the cluster except through the API server. |
+| **scheduler** | Decides **which node** a new pod runs on — weighing node resources, `nodeSelector`, taints/tolerations, affinity, and TopologySpreadConstraints. It only *chooses*; the kubelet does the running. |
+| **controller-manager** | Runs the control loops that drive reality toward desired state: **Node controller** (keeps the desired node count), **EndpointSlice controller** (attaches pod IPs as a Service's endpoints), **ServiceAccount controller** (creates/manages SAs), **Job controller** (one-off task resources). |
+| **etcd** | The cluster's **memory** — a key-value store holding every object: manifests, ConfigMaps, Secrets, current state. Lose etcd and you lose the cluster's brain. |
+| **cloud-controller-manager** | The bridge to the cloud provider — provisions the real ELBs, EBS volumes, routes when a Service or PVC asks. |
+
+The flow of any command: `kubectl apply` → **API server** (authN/authZ, validate) → writes desired state to **etcd** → **scheduler** picks a node → **kubelet** on that node runs the pod → **controller-manager** loops keep it matching desired state.
+
+### Node components
+
+| Component | Job |
+|-----------|-----|
+| **kubelet** | The agent on every node — the control plane's man on the ground. It **runs the pods** the scheduler assigned and continuously **reports node/pod status** back to the API server. |
+| **kube-proxy** | Programs the node's network rules so traffic to a Service IP actually **reaches the backing pods**. |
+| **Container runtime** | Actually pulls images and runs containers. On EKS this is **containerd**. |
+
+### Add-ons
+
+Add-ons are the pluggable pieces layered on top — **VPC-CNI** (pod networking, above), **CoreDNS** (in-cluster DNS), **kube-proxy**, the **EBS/EFS CSI drivers**, **metrics-server** (feeds HPA). Everything students have built maps onto this skeleton: Namespace → Pod → Services → Sets (ReplicaSet/Deployment/StatefulSet/DaemonSet) → HPA → PV/PVC/SC → Ingress/Gateway → RBAC/SA → taints & selectors → TopologySpread & PDB → Helm → cluster upgrades → blue-green → network policies.
+
+---
+
 ## Quick Reference
 
 | Concept | One-liner |
@@ -2147,6 +2339,35 @@ The whole magic is in **switching the route of the main Service** — the deploy
 | **Canary** | Release to a few users, monitor, then widen |
 | **A/B testing** | Route a segment (geo/device) to v2 — testing a change, not just shipping |
 | **Shadow** | Copy live v1 traffic to v2 silently — real load, no user impact |
+| **HA layers** | Node-level (replicas on different **nodes**) + zone-level (across **zones**) |
+| AWS HA baseline | **3 zones, ≥2 nodes per zone**; odd zone count for quorum |
+| **TopologySpreadConstraints** | Force even pod spread across a domain (zone/node) — stops all replicas clumping |
+| `maxSkew` | Max allowed pod-count gap between fullest and emptiest domain |
+| `topologyKey` | *What* to spread over — `.../zone` or `.../node` (EKS labels nodes automatically) |
+| `whenUnsatisfiable` | `DoNotSchedule` (hard → leave Pending) vs `ScheduleAnyway` (soft → prefer balance) |
+| **PodDisruptionBudget** | Minimum pods that must stay up during **voluntary** disruptions |
+| `minAvailable` / `maxUnavailable` | The floor for a PDB — blocks a drain that would breach it |
+| PDB's limit | Guards **voluntary** (drain/upgrade/autoscale); useless for **crashes** (involuntary) |
+| Voluntary vs involuntary | PDB stops planned evictions; TopologySpread + replicas survive the unplanned crash |
+| **VPC-CNI** | EKS networking add-on — pods get a **real VPC IP** (first-class citizens) |
+| Pods per node | Capped by **ENIs × IPs/ENI − 1**, not just CPU/RAM (t3.small ≈ 11) |
+| IP exhaustion | Can run out of pod slots with CPU/RAM to spare → add nodes for **IPs** |
+| `enableNetworkPolicy` | VPC-CNI flag that turns on NetworkPolicy enforcement on EKS |
+| **NetworkPolicy** | Pod-level firewall; **no policy = all traffic allowed** in the namespace |
+| Default-deny pattern | `podSelector: {}` + `policyTypes: [Ingress]` → shut all in, then allow narrowly |
+| `podSelector: {}` | Empty selector = **every pod** in the namespace |
+| NetworkPolicies are additive | They only ever **allow**; deny broadly, punch specific holes |
+| `namespaceSelector` | Allow traffic **from another namespace** (e.g. monitoring → metrics port) |
+| **Control plane** | apiserver + scheduler + controller-manager + etcd + cloud-controller-manager |
+| **kube-apiserver** | Front door — authN/authZ + validate; everything goes through it |
+| **scheduler** | *Chooses* the node (resources, selectors, taints, affinity, spread); kubelet runs it |
+| **controller-manager** | Control loops: Node, EndpointSlice, ServiceAccount, Job controllers |
+| **etcd** | Cluster memory — key-value store of every object (manifests, ConfigMaps, Secrets) |
+| **cloud-controller-manager** | Bridge to the cloud — provisions ELB/EBS/routes |
+| **kubelet** | Node agent — runs assigned pods, reports node/pod status |
+| **kube-proxy** | Programs node network rules so Service IPs reach pods |
+| **Container runtime** | Runs containers; **containerd** on EKS |
+| Add-ons | Pluggable layer — VPC-CNI, CoreDNS, kube-proxy, CSI drivers, metrics-server |
 | **startupProbe** | Has it booted? Runs **once**; buys slow starters time |
 | **readinessProbe** | Ready for traffic? Fails → **removed from Service endpoints** (no restart) |
 | **livenessProbe** | Still alive? Fails → **pod restarted** |
