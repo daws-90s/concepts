@@ -440,6 +440,89 @@ This is the CI mirror of git's "one codebase, many environments" (see [[git]]): 
 
 ---
 
+# GitHub Token & Slack Setup for Jenkins
+
+Covers the two credentials the RoboShop pipelines need:
+
+- `github-token` — used by `utils.groovy` for commit statuses, PR creation, and the
+  `library-scan` stage's Dependabot alerts check.
+- `slack-token` — used by `nodejsEKSPipeline.groovy`'s `post { success/failure }` Slack
+  notifications.
+
+## 1. Create the GitHub fine-grained token
+
+1. GitHub → your profile photo → **Settings** → **Developer settings** →
+   **Personal access tokens** → **Fine-grained tokens** → **Generate new token**.
+2. Fill in:
+   - **Token name**: e.g. `jenkins-roboshop-ci`
+   - **Expiration**: pick a value your org allows (90 days is a safe default — set a
+     calendar reminder to rotate it).
+   - **Resource owner**: the `90s-org` organization.
+   - **Repository access**: **Only select repositories** → pick `catalogue` (and any
+     other repos the pipeline runs against).
+3. Under **Permissions → Repository permissions**, set:
+   - **Dependabot alerts**: `Read-only`
+   - **Commit statuses**: `Read and write`
+   - **Pull requests**: `Read and write` — also required, since `utils.groovy`'s
+     `createPullRequest()` uses this same token for the `raise-pr` stage.
+4. Click **Generate token** and **copy it immediately** — GitHub only shows it once.
+5. If the org enforces fine-grained token approval, an org owner must approve the
+   request before it becomes active (**Settings → Developer settings → Personal access
+   tokens** on the org side).
+
+## 2. Add the GitHub token to Jenkins
+
+1. Jenkins → **Manage Jenkins** → **Credentials** → **System** → **Global credentials
+   (unrestricted)** → **Add Credentials**.
+2. Set:
+   - **Kind**: `Secret text`
+   - **Secret**: paste the token from step 1
+   - **ID**: `github-token` (must match exactly — this is the `credentialsId` referenced
+     in `utils.groovy` and the pipeline's `library-scan` stage)
+   - **Description**: `GitHub fine-grained PAT for RoboShop CI`
+3. **Create**.
+
+## 3. Create the Slack app
+
+1. Go to `https://api.slack.com/apps` → **Create New App** → **From scratch**.
+2. Name it (e.g. `Jenkins CI`) and pick your workspace.
+3. In the app's left sidebar, go to **OAuth & Permissions**.
+4. Under **Scopes → Bot Token Scopes**, add:
+   - `chat:write` — lets the bot post messages
+   - `chat:write.public` — optional, lets it post to public channels without being
+     invited first
+5. Scroll up and click **Install to Workspace** (or **Install App**), then **Allow**.
+6. Copy the **Bot User OAuth Token** (starts with `xoxb-`) shown on that page.
+7. In Slack, invite the bot to the target channel: open `#test-ci` and run
+   `/invite @Jenkins CI` (skip this if you added `chat:write.public`).
+
+## 4. Add the Slack token to Jenkins
+
+1. Jenkins → **Manage Jenkins** → **Plugins** → confirm **Slack Notification** plugin
+   is installed.
+2. **Manage Jenkins** → **Credentials** → **System** → **Global credentials** →
+   **Add Credentials**:
+   - **Kind**: `Secret text`
+   - **Secret**: paste the `xoxb-...` bot token
+   - **ID**: `slack-token` (must match the `tokenCredentialId` used in
+     `nodejsEKSPipeline.groovy`'s `slackSend` calls)
+3. **Manage Jenkins** → **System** → scroll to the **Slack** section:
+   - **Workspace**: your workspace subdomain (e.g. `90s-org` for
+     `https://90s-org.slack.com`)
+   - **Credential**: select the `slack-token` credential
+   - **Default channel**: `#test-ci` (optional — the pipeline already passes `channel:`
+     explicitly)
+4. Click **Test Connection**, then **Save**.
+
+## 5. Verify
+
+- Trigger a build and confirm:
+  - `library-scan` stage successfully fetches Dependabot alerts (no 403/404).
+  - Commit status checks appear on the GitHub commit/PR.
+  - `raise-pr` stage opens a PR (on non-`main` branches).
+  - A Slack message lands in `#test-ci` on success/failure.
+
+
 ## Quick Reference
 
 | Concept | One-liner |
