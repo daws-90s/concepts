@@ -35,6 +35,32 @@ clone → install deps → authenticate → build → scan → unit test → (ar
 
 You add or remove plugins whenever you want — the server grows to fit the job.
 
+### Plugins the RoboShop Pipelines Actually Use
+
+Every non-trivial line in `nodejsEKSMain.groovy` / `nodejsEKSPipeline.groovy` traces back to one of these:
+
+| Plugin | Adds | Used for |
+|--------|------|----------|
+| **Pipeline: AWS Steps** | `withAWS { }` | Every AWS/EKS/ECR block — injects credentials into the step instead of exporting them as shell env vars |
+| **Generic Webhook Trigger** | `triggers { GenericTrigger(...) }` | Lets Jira Automation start a build over HTTP with a token — no GitHub push involved |
+| **JIRA Steps** (`jira-steps-plugin`) | `jiraNewIssue`, `jiraGetIssue`, `jiraGetIssueTransitions`, `jiraTransitionIssue`, `jiraGetFields` | Every Jira call in `utils.groovy` |
+| **Slack Notification** | `slackSend(...)` | `post { success/failure }` build alerts |
+| **SonarQube Scanner** | `withSonarQubeEnv`, `waitForQualityGate()` | Static analysis + quality gate (see below) |
+| **Pipeline Utility Steps** | `readJSON file: 'package.json'` | Reading the app version straight out of the repo |
+| **Multibranch Scan Webhook Trigger** | A webhook endpoint on the Multibranch Pipeline job itself | Re-triggers the branch/PR scan on a push, without relying on GitHub's own webhook integration (see below) |
+
+### Credentials RoboShop Needs
+
+| Credential ID | Kind | Used by | Purpose |
+|---------------|------|---------|---------|
+| `aws-creds` | AWS Credentials | every `withAWS` block | EKS/ECR access |
+| `github-token` | Secret text | `utils.groovy` (commit status, tag, PR), `library-scan` | GitHub API calls — see generation steps below |
+| `slack-token` | Secret text | `post` blocks' `slackSend` | Slack bot token — see Slack app steps below |
+| `jira-secret` | Secret text | `triggers { GenericTrigger(...) }` | Validates the `?token=...` on the incoming Jira webhook URL |
+| `ssh-auth` | SSH Username with private key | Jenkins controller → agent node | Lets the master SSH in as `ec2-user` to launch the `ROBOSHOP`-labelled agent — see Master–Agent Architecture below |
+| `sonar-creds` | Secret text | SonarQube server config | The Sonar authentication token — selected (not pasted raw) under **Manage Jenkins → System → SonarQube servers** |
+| `jira-creds` | Username with password | JIRA Steps site config, via the `JIRA_SITE` env var | **Username** = Jira account email, **Password** = Jira API token (not the account password) — Jira rejects ticket creation without this exact shape. Selected once under **Manage Jenkins → System → JIRA Steps**, naming the site (e.g. `roboshop-jira`) and its URL |
+
 Installation is a short script (RHEL-family): add the Jenkins repo, install Java (Jenkins runs on the JVM) and Jenkins itself, then start and enable the service.
 
 ```bash
@@ -59,6 +85,8 @@ Jenkins runs as a **master (controller)** with one or more **agent nodes**.
 
 - The **master never runs builds itself.** It receives the trigger, decides *which agent* should run the build, hands it off, then **monitors the node and collects the logs**.
 - **Agent nodes** do the real work. You keep **separate nodes for different stacks** — a node configured for Java, another for NodeJS, another for iOS/Android — each with the right tools installed.
+
+Connecting an agent node (**Manage Jenkins → Nodes → New Node**, launch method **Launch agents via SSH**) needs an SSH credential: **Kind** `SSH Username with private key`, **Username** `ec2-user` (the default login user on Amazon Linux/RHEL EC2 instances), stored as the `ssh-auth` credential. The controller uses this to SSH into the agent box and start the agent process — no manual login required once it's configured.
 
 ```
         commit → trigger
@@ -97,6 +125,17 @@ Jenkins offers two kinds of jobs. **Freestyle** is the old click-through style; 
 | Track who changed what | Hard | Git history |
 
 The Freestyle problem in one line: **everything lives in the UI** — no version control, no easy restore, no audit trail, no reuse. Pipeline fixes all of that by treating the build definition as **code that lives beside the app**.
+
+## Multibranch Pipelines & the Scan Webhook
+
+A **Multibranch Pipeline** job doesn't point at one branch — it scans a whole repo and auto-creates a sub-job per branch/PR that has a `Jenkinsfile`, and removes the job again when the branch disappears. That's what produces job paths like `ROBOSHOP/catalogue/main`, and what makes `env.BRANCH_NAME` meaningful in a `Jenkinsfile` (used further down to split `main` from feature branches).
+
+1. Jenkins → **New Item** → **Multibranch Pipeline**, named e.g. `catalogue` inside a `ROBOSHOP` folder.
+2. **Branch Sources → Git**: repository URL (e.g. `https://github.com/90s-org/catalogue.git`), credentials, **Discover branches**.
+3. **Build Configuration**: by Jenkinsfile, path `Jenkinsfile` — the one-liner that calls `nodejsEKSPipeline`/`nodejsEKSMain`.
+4. **Scan Multibranch Pipeline Triggers** → check the trigger the **Multibranch Scan Webhook Trigger** plugin adds, and set a token. That gives the job its own webhook endpoint — `http://jenkins.daws90s.shop:8080/multibranch-webhook-trigger/invoke?token=<token>` — that GitHub (or anything) can POST to, to re-trigger the branch/PR scan on demand instead of waiting on a poll interval. This is the generic-SCM equivalent of GitHub's own push-triggered rescan, without needing a GitHub-specific branch source plugin.
+
+**Why the branch jobs are read-only:** because a branch-level job under a Multibranch Pipeline is entirely *computed* from the repo scan, its Configure page in the UI is locked — you can't tick "Trigger builds remotely" by hand, even as an admin. This matters again later: it's exactly why the release pipeline's Jira trigger has to be declared inside the `Jenkinsfile` itself (`triggers { GenericTrigger(...) }`) rather than clicked in through the UI.
 
 ## Declarative vs Scripted Pipelines
 
@@ -265,6 +304,17 @@ sonar.exclusions=node_modules/**,Jenkinsfile,Dockerfile,coverage/**,test/**
 sonar.javascript.lcov.reportPaths=coverage/lcov.info   # coverage feeds the gate
 sonar.junit.reportPaths=junit.xml
 ```
+
+### Wiring the Sonar Server Into Jenkins
+
+Sonar and Jenkins talk **both ways**: Jenkins pushes the analysis *to* Sonar, and Sonar reports the quality-gate result *back* to Jenkins via a webhook — `waitForQualityGate()` blocks waiting for that callback rather than polling, so the callback has to actually be configured or the stage just hangs until its own timeout.
+
+1. Run the SonarQube server itself (own VM/container), reachable at e.g. `http://sonar.daws90s.shop:9000`.
+2. In Sonar: **My Account → Security → Generate Token** — this is what Jenkins authenticates with.
+3. In Jenkins: **Manage Jenkins → Credentials** → add the token from step 2 as a **Secret text** credential, ID `sonar-creds` — don't paste it raw into the server config, store it as a credential like everything else.
+4. **Manage Jenkins → System → SonarQube servers** → add one. **Name** must match the pipeline's `withSonarQubeEnv('sonar-server')` exactly; **Server URL**, and **Server authentication token**: select the `sonar-creds` credential.
+5. **Manage Jenkins → Tools → SonarQube Scanner installations** → add one named `sonar-8` (matches `tool 'sonar-8'` in the pipeline), pick a version, let Jenkins auto-install it.
+6. In Sonar: **Administration → Configuration → Webhooks** → add one pointing back at Jenkins: `http://jenkins.daws90s.shop:8080/sonarqube-webhook/`. Without this step, `waitForQualityGate()` never hears back and the stage just times out after 10 minutes instead of getting a real answer.
 
 ### Rolling Sonar out without a revolt — the phased approach
 
@@ -522,6 +572,146 @@ Covers the two credentials the RoboShop pipelines need:
   - `raise-pr` stage opens a PR (on non-`main` branches).
   - A Slack message lands in `#test-ci` on success/failure.
 
+---
+
+# The RoboShop Release Pipeline — DEV → SIT → UAT → PROD
+
+Everything above is the **CI pipeline** — one component, one branch, build/scan/test/push. This section covers the second, bigger pipeline (`nodejsEKSMain.groovy`) that takes an image that already passed CI and **promotes** it through four real environments, gated by GitHub and tracked by one Jira ticket per release.
+
+## Generic Webhook Trigger — Letting Jira Start a Build
+
+Normally something pushes to GitHub and Jenkins reacts. Here, Jira *also* needs to start builds (SIT/UAT/PROD) with no code push and no GitHub event involved. The **Generic Webhook Trigger** plugin turns any authenticated HTTP POST into a build trigger, and can lift fields straight out of the JSON body into `env.*`:
+
+```groovy
+// jenkins-shared-library/vars/nodejsEKSMain.groovy
+triggers {
+    GenericTrigger(
+        genericVariables: [
+            [key: 'ENVIRONMENT', value: '$.ENVIRONMENT'],   // JSONPath into the POST body
+            [key: 'COMMIT_ID',   value: '$.COMMIT_ID'],
+            // ...
+        ],
+        tokenCredentialId: 'jira-secret',                   // the whole authentication story
+        causeString: 'Triggered by Jira Automation'
+    )
+}
+```
+
+The URL Jira's Automation "Send web request" action calls:
+
+```
+http://jenkins.daws90s.shop:8080/generic-webhook-trigger/invoke?token=<jira-secret value>
+```
+
+Because this path populates `env.*` and a manual "Build with Parameters" run only ever populates `params.*`, the pipeline can't just read one or the other — `resolve-inputs` (env wins when present, falls back to params) is what lets one build handle both trigger paths.
+
+## `utils.groovy` — What Each Helper Actually Does
+
+| Function | Does | Notable design choice |
+|----------|------|------------------------|
+| `updateCommitStatus(state, description, context)` | POSTs a GitHub commit status | Lowercases `state` — GitHub's API returns a 422 on anything but `error/failure/pending/success` |
+| `validateCommitStatus(commitSha, requiredContexts)` | Fails the build unless every named context is `success` on that commit | The real promotion gate — see below |
+| `getPodIP(namespace, component)` | `kubectl get pod ... -o jsonpath='{.items[0].status.podIP}'` | The Jenkins agent can't resolve `*.svc.cluster.local`, but shares a VPC with EKS — routes to pods by IP instead of cluster DNS |
+| `tagCommit(commitSha, tag)` | Creates a `refs/tags/<tag>` GitHub ref on the commit | A real, permanent GitHub release marker — not a Jenkins-only concept |
+| `createJiraTicket(projectKey, commitId, version)` | Looks up the `Commit ID`/`Version` custom field **IDs by name**, then `jiraNewIssue` | Looked up at runtime instead of hardcoding `customfield_XXXXX` — survives the Jira site being rebuilt |
+| `transitionJiraIssue(issueKey, targetStatus)` | Finds a transition whose **destination status name** matches, fires it | Matches by where the transition *goes*, not what it's *labelled* — labels on the workflow diagram aren't guaranteed to mean anything |
+| `safeTransitionJiraIssue(issueKey, targetStatus)` | Same, wrapped so a failure only logs a warning | Jira being down must never fail an otherwise-good deploy, overwrite a correct GitHub status, or hide the real exception |
+| `createPullRequest(base, title, body)` | Opens `branch → base` if one isn't already open | Used by the CI pipeline's `raise-pr` stage, not the release pipeline |
+
+## Validating at Every Gate — Why Nothing Can Skip a Step
+
+In a naive setup, anyone with Jenkins access could run "Build with Parameters", pick `ENVIRONMENT=prod`, and skip SIT/UAT entirely. The Jira ticket *saying* "UAT Done" proves nothing if nobody checks it. So the pipeline doesn't trust the ticket — it trusts GitHub.
+
+Each stage posts its own named commit status. Promoting to the next environment requires every status the earlier environments would have posted, re-checked fresh against the real commit:
+
+| Target env | Required contexts before it'll deploy |
+|------------|----------------------------------------|
+| sit | `dev-deploy`, `api-tests` |
+| uat | + `sit-deploy`, `sit-integration-tests` |
+| prod | + `uat-deploy`, `uat-regression-tests` |
+
+A commit genuinely cannot reach PROD without having passed real SIT and UAT runs — even a manually-triggered build with the "right" parameters fails at `validate-commit-status` if those contexts aren't present. GitHub commit statuses are the actual gate; the Jira ticket is just the human-facing tracker riding on top.
+
+## The CR (Change Request) Gate
+
+In real companies, a **Change Request (CR)** is the paperwork trail for anything touching production: what's changing, why, when, who approved it, how to undo it. Larger orgs route changes through a **CAB (Change Advisory Board)** — a review before a deploy is allowed into a defined change window.
+
+- **Standard** change — pre-approved, low-risk, repeatable (this kind of routine app deploy would normally be one).
+- **Normal** change — needs case-by-case approval.
+- **Emergency** change — skips the normal cycle for an active incident, approved after the fact.
+
+The pipeline's `change-request-check` models the *shape* of this, without a real CR/ITSM system behind it yet:
+
+```groovy
+// nodejsEKSMain.groovy — change-request-check (condensed)
+if (!env_CR_NUMBER?.trim()) { error("CR_NUMBER is required for a prod deploy") }
+if (!env_VERSION?.trim())   { error("VERSION is required for a prod deploy") }
+
+/* Dummy deployment-window check — blocks weekends. Placeholder for a real CR lookup. */
+def dayOfWeek = sh(script: 'date +%u', returnStdout: true).trim().toInteger()
+if (dayOfWeek >= 6) { error("outside the approved deployment window") }
+
+input message: "Approve prod deploy ...?", ok: 'Approve'   // the CAB stand-in
+```
+
+**CR Number** is a required field, filled in on the Jira ticket via a transition screen when moving to `Trigger PROD` — the same idea as a real CR ticket number being attached before a change proceeds. The `input` step is the human approval; it runs with its **own 4-hour timeout**, separate from the pipeline's overall 15-minute budget, so waiting on a person doesn't get killed by an unrelated timeout.
+
+## Testing Team Roles & Responsibilities
+
+Who owns which layer of testing, grounded in the actual file/job split:
+
+| Test layer | Owned by | Where it lives | Mocked? |
+|------------|----------|-----------------|---------|
+| Unit tests | Developers | `catalogue/test/` | Yes — DB and other services mocked |
+| API tests (dev gate) | Dev/SDET | Jenkins job `catalogue-api-tests` | No — real component, real dev namespace |
+| Integration tests (SIT gate) | SDET | `roboshop-integration-tests/` | No — live HTTP, cross-service |
+| Regression tests (UAT gate) | SDET | `roboshop-regression-tests/` | No — live HTTP, cross-service |
+| Smoke tests (prod) | SDET | `catalogue/smoke/` | No — live HTTP against the just-deployed prod release |
+
+The pattern: tests get **less isolated and more end-to-end** the closer you get to production. Unit tests trust nothing is real; smoke tests trust *everything* is real — they're the last check that the actual prod deployment (not just the image) genuinely works, run in-process in the same pipeline build rather than as a separate Jenkins job.
+
+## Rollback on a Bad Deploy
+
+```groovy
+// nodejsEKSMain.groovy — prod-deploy (condensed)
+def releaseExists = sh(script: "helm status ${component} -n roboshop-prod > /dev/null 2>&1", returnStatus: true) == 0
+try {
+    sh "helm upgrade --install ... --wait --timeout 5m"
+}
+catch (Exception e) {
+    if (releaseExists) {
+        sh "helm rollback ${component} 0 -n roboshop-prod --wait --timeout 5m"   // back to the previous revision
+    }
+    // else: first-ever deploy — nothing to roll back to, just fails
+    throw e
+}
+```
+
+`helm rollback <release> 0` means "the immediately preceding revision" — Helm keeps its own version history per release. Rollback only makes sense if a previous good release exists, which is why `helm status` is checked *before* even attempting the deploy.
+
+**Known gap worth flagging to students:** `smoke-tests` (which runs *after* `prod-deploy` succeeds) does **not** trigger a rollback if it fails — the bad release stays live until a human acts. A deploy-time failure rolls back automatically; a failure only detected *after* deploy currently doesn't.
+
+## Build Once, Run Anywhere — In Full
+
+Earlier in this doc, image promotion was shown retagging with a short id. The release pipeline goes further: it never truncates the SHA at all, anywhere:
+
+```groovy
+// nodejsEKSMain.groovy — promote-image
+docker pull    .../catalogue:${appVersion}
+docker tag     .../catalogue:${appVersion} .../catalogue:${env.GIT_COMMIT}   // full 40-char SHA
+docker push    .../catalogue:${env.GIT_COMMIT}
+```
+
+That full SHA is then the *only* identity the image carries through SIT/UAT/PROD — it's what's stored as the Jira ticket's `Commit ID` field, what `validate-commit-status` checks GitHub statuses against, and what every `helm upgrade --set deployment.imageVersion=...` deploys:
+
+```
+DEV:  build catalogue:1.0.0 (app version) → promote → catalogue:e551cedf...53fe (full commit SHA)
+SIT:  helm upgrade --set deployment.imageVersion=e551cedf...53fe
+UAT:  helm upgrade --set deployment.imageVersion=e551cedf...53fe
+PROD: helm upgrade --set deployment.imageVersion=e551cedf...53fe
+```
+
+One image, one identity, deployed unchanged four times — the whole point of "build once, run anywhere."
 
 ## Quick Reference
 
@@ -566,5 +756,22 @@ Covers the two credentials the RoboShop pipelines need:
 | **Commit ID** | Identity of the code — unchanged id = unchanged code |
 | **Build once, run anywhere** | Build the image once; **promote** (retag with commit id) across envs |
 | Image promotion | Pull from ECR → retag `1.0.0 → t357ad1`; don't rebuild per env |
+| **Multibranch Pipeline** | Scans a whole repo, auto-creates a sub-job per branch/PR with a Jenkinsfile |
+| Branch job Configure page | Locked/read-only — computed from the scan; triggers must live in the Jenkinsfile |
+| **Multibranch Scan Webhook Trigger** | Gives a Multibranch job its own webhook to re-trigger a rescan, SCM-agnostic |
+| `ssh-auth` credential | SSH Username with private key, `ec2-user` — controller → agent connection |
+| `sonar-creds` credential | Secret text holding the Sonar token — selected in SonarQube server config, never pasted raw |
+| **Generic Webhook Trigger** | Any authenticated POST can start a build; JSONPath lifts fields into `env.*` |
+| `resolve-inputs` pattern | `env.*` (webhook) wins, falls back to `params.*` (manual) — one build, two trigger paths |
+| **`validate-commit-status`** | Re-checks required GitHub commit-status contexts before promoting — the real gate, not the Jira ticket |
+| Accumulating contexts | sit needs dev's; uat needs sit's too; prod needs uat's too — can't skip a step |
+| **CR (Change Request)** | Paperwork trail for a prod change: what/why/when/who/rollback; reviewed by a CAB |
+| CR types | Standard (pre-approved) · Normal (case-by-case) · Emergency (after-the-fact) |
+| `change-request-check` | CR_NUMBER + VERSION required, dummy window check, manual `input` = the CAB stand-in |
+| Testing ownership | Unit (dev, mocked) → API/Integration/Regression (SDET, live) → Smoke (SDET, live prod) |
+| **Rollback** | `helm rollback <release> 0` on a failed deploy over an *existing* release only |
+| Rollback gap | Deploy-time failure auto-rolls-back; smoke-test failure (post-deploy) currently doesn't |
+| **JIRA Steps plugin** | `jira*` pipeline steps; site auth configured once under Manage Jenkins → System |
+| `utils.groovy` Jira helpers | `createJiraTicket` (fields by name) · `transitionJiraIssue` (by destination status) · `safeTransitionJiraIssue` (best-effort) |
 
 ---
